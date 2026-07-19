@@ -28,6 +28,8 @@ import json
 import os
 import re
 import sys
+import time
+import traceback
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -57,15 +59,41 @@ class Client:
             urllib.request.HTTPCookieProcessor(self.cj)
         )
 
-    def _open(self, req):
-        try:
-            resp = self.opener.open(req, timeout=30)
-            return resp.getcode(), resp.read().decode("utf-8", "ignore")
-        except urllib.error.HTTPError as e:
-            return e.code, e.read().decode("utf-8", "ignore")
+    def _open(self, req, retries=2):
+        """Open a request, retrying transient network/5xx failures.
+
+        Serverless (Vercel) cold starts and blips occasionally return a 5xx or a
+        dropped connection; a couple of quick retries make cron runs reliable.
+        """
+        last = None
+        for attempt in range(retries + 1):
+            try:
+                resp = self.opener.open(req, timeout=30)
+                return resp.getcode(), resp.read().decode("utf-8", "ignore")
+            except urllib.error.HTTPError as e:
+                body = e.read().decode("utf-8", "ignore")
+                if e.code < 500 or attempt == retries:
+                    return e.code, body
+                last = (e.code, body)
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
+                if attempt == retries:
+                    raise
+                last = (0, str(e))
+            time.sleep(1 + attempt)
+        return last
 
     def get(self, path):
         return self._open(urllib.request.Request(BASE_URL + path))
+
+    def get_json(self, path):
+        """GET and parse JSON, returning (code, obj-or-None)."""
+        code, text = self.get(path)
+        if code != 200:
+            return code, None
+        try:
+            return code, json.loads(text)
+        except json.JSONDecodeError:
+            return code, None
 
     def post_form(self, path, data):
         body = urllib.parse.urlencode(data).encode()
@@ -121,20 +149,22 @@ class Client:
 
 
 def login(c):
-    code, text = c.get("/api/auth/csrf")
-    if code != 200:
+    code, obj = c.get_json("/api/auth/csrf")
+    if not obj or "csrfToken" not in obj:
         raise RuntimeError(f"csrf failed: HTTP {code}")
-    csrf = json.loads(text)["csrfToken"]
+    csrf = obj["csrfToken"]
     email = os.environ["PKMN_EMAIL"]
     password = os.environ["PKMN_PASSWORD"]
     c.post_form(
         "/api/auth/callback/credentials",
         {"csrfToken": csrf, "email": email, "password": password, "json": "true"},
     )
-    code, text = c.get("/api/auth/session")
-    if code != 200 or not text.strip() or text.strip() == "{}":
-        raise RuntimeError("login failed: no session (check PKMN_EMAIL/PKMN_PASSWORD)")
-    user = json.loads(text).get("user", {})
+    code, obj = c.get_json("/api/auth/session")
+    user = (obj or {}).get("user")
+    if not user:
+        raise RuntimeError(
+            f"login failed: no session (HTTP {code}; check PKMN_EMAIL/PKMN_PASSWORD)"
+        )
     log(f"logged in as {user.get('name')} <{user.get('email')}>")
 
 
@@ -173,13 +203,12 @@ def run():
     login(c)
     actions = discover_actions(c)
 
-    code, text = c.get("/api/collection")
-    if code != 200:
+    code, collection = c.get_json("/api/collection")
+    if not isinstance(collection, list):
         raise RuntimeError(f"collection fetch failed: HTTP {code}")
-    collection = json.loads(text)
 
-    code, text = c.get("/api/me")
-    me = json.loads(text) if code == 200 else {}
+    _, me = c.get_json("/api/me")
+    me = me or {}
 
     now = now_utc()
     fed = played = revived = failed = 0
@@ -221,8 +250,8 @@ def run():
         c.call_action("/collection", actions["claimDailyGiftAction"], [])
         # Verify by state rather than trusting the flight shape, which we haven't
         # observed: if it's still claimable afterwards, the claim really failed.
-        code, text = c.get("/api/me")
-        if code == 200 and json.loads(text).get("dailyGift", {}).get("availableNow"):
+        _, after = c.get_json("/api/me")
+        if (after or {}).get("dailyGift", {}).get("availableNow"):
             failed += 1
             log("  gift claim failed: still available after claim")
 
@@ -242,7 +271,10 @@ def main():
     try:
         failed = run()
     except Exception as e:  # noqa: BLE001 - top-level guard for cron visibility
+        # Print the full traceback so a failed cron run is debuggable from the
+        # Actions log without needing to reproduce it.
         print(f"ERROR: {e}", file=sys.stderr)
+        traceback.print_exc()
         return 1
     return 1 if failed else 0
 
