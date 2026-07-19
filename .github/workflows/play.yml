@@ -2,9 +2,8 @@ name: play-pokemons
 
 on:
   schedule:
-    # Every 10 minutes. Feed cooldown is 30 min, play is 20 min, so this always
-    # catches a cooldown promptly even with GitHub's scheduling jitter.
-    - cron: "*/10 * * * *"
+    # Fires at 00/06/12/18 UTC.
+    - cron: "0 */6 * * *"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
 # Never let two runs overlap.
