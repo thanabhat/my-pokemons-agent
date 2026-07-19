@@ -195,7 +195,17 @@ def now_utc():
 
 
 def parse_ts(s):
-    return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    """Parse an ISO timestamp, or None if the field is null/missing.
+
+    A null cooldown means the Pokemon has no active cooldown (e.g. newly
+    acquired and never fed) -- i.e. it's actionable right now.
+    """
+    if not s:
+        return None
+    try:
+        return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    except (ValueError, TypeError):
+        return None
 
 
 def fmt_cd(dt, now):
@@ -263,11 +273,11 @@ def run():
             log(f"{name:<14} [{species}] {stats} | {state}")
             continue
 
-        feed_dt = parse_ts(p["feedCooldownEndsAt"])
-        play_dt = parse_ts(p["playCooldownEndsAt"])
+        feed_dt = parse_ts(p.get("feedCooldownEndsAt"))
+        play_dt = parse_ts(p.get("playCooldownEndsAt"))
 
-        # --- feed ---
-        if feed_dt > now:
+        # --- feed --- (feed_dt is None => no cooldown => ready now)
+        if feed_dt is not None and feed_dt > now:
             on_cooldown += 1
             next_feed.append((feed_dt, name))
             feed_state = f"feed: cooldown {fmt_cd(feed_dt, now)}"
@@ -282,8 +292,8 @@ def run():
             else:
                 failed += 1; feed_state = f"feed: FAILED ({detail})"
 
-        # --- play ---
-        if play_dt > now:
+        # --- play --- (play_dt is None => no cooldown => ready now)
+        if play_dt is not None and play_dt > now:
             on_cooldown += 1
             next_play.append((play_dt, name))
             play_state = f"play: cooldown {fmt_cd(play_dt, now)}"
