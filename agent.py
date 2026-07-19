@@ -198,6 +198,15 @@ def parse_ts(s):
     return datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
+def fmt_cd(dt, now):
+    """Human-readable cooldown remaining, e.g. 'ready' or '12m04s'."""
+    secs = (dt - now).total_seconds()
+    if secs <= 0:
+        return "ready"
+    m, s = divmod(int(secs), 60)
+    return f"{m}m{s:02d}s"
+
+
 def run():
     c = Client()
     login(c)
@@ -211,54 +220,113 @@ def run():
     me = me or {}
 
     now = now_utc()
-    fed = played = revived = failed = 0
+    coins = me.get("coins", "?")
+    gift = me.get("dailyGift", {}) or {}
+    gift_state = (
+        "AVAILABLE now"
+        if gift.get("availableNow")
+        else f"next at {gift.get('nextGiftAvailableAt', '?')}"
+    )
+    log(
+        f"account: coins={coins} | daily-gift: {gift_state} | "
+        f"pokemon={len(collection)}" + (" | DRY_RUN" if DRY_RUN else "")
+    )
 
-    def do(path, action_name, args, label):
-        """Run an action, log the outcome, and return 1 on success else 0."""
-        nonlocal failed
-        if DRY_RUN:
-            return 1
-        status, detail = c.call_action(path, actions[action_name], args)
-        if status == "ok":
-            return 1
-        if status == "cooldown":
-            return 0  # benign: cooldown ticked over between read and write
-        failed += 1
-        log(f"  {label} failed: {detail}")
-        return 0
+    fed = played = revived = failed = on_cooldown = 0
+    next_feed = []  # (datetime, name) for pokemon still on feed cooldown
+    next_play = []
+
+    def act(pid, action_name):
+        """Perform an action; return (status, detail)."""
+        return c.call_action(f"/collection/{pid}", actions[action_name], [pid])
 
     for p in collection:
         pid = p["id"]
-        name = p.get("nickname") or p.get("pokemon", {}).get("name", pid)
+        name = p.get("nickname") or p.get("pokemon", {}).get("name") or pid
+        species = p.get("pokemon", {}).get("name", "?")
+        heart = p.get("heart", 0)
+        full = p.get("currentFullness", 0)
+        mood = p.get("currentMood", 0)
+        streak = p.get("activeStreak", 0)
+        stats = f"heart={heart:3.0f} full={full:3.0f} mood={mood:3.0f} streak={streak}"
 
+        # --- fainted: revive, skip feed/play this run ---
         if p.get("isFainted"):
-            log(f"{name}: fainted -> revive")
-            revived += do(f"/collection/{pid}", "reviveAction", [pid], "revive")
-            continue  # skip feed/play this run; next run handles the revived pet
+            if DRY_RUN:
+                state = "FAINTED (would revive)"
+            else:
+                status, detail = act(pid, "reviveAction")
+                if status == "ok":
+                    revived += 1; state = "FAINTED -> REVIVED"
+                else:
+                    failed += 1; state = f"FAINTED -> revive FAILED ({detail})"
+            log(f"{name:<14} [{species}] {stats} | {state}")
+            continue
 
-        if parse_ts(p["feedCooldownEndsAt"]) <= now:
-            log(f"{name}: feeding (fullness {p['currentFullness']:.0f})")
-            fed += do(f"/collection/{pid}", "feedAction", [pid], "feed")
+        feed_dt = parse_ts(p["feedCooldownEndsAt"])
+        play_dt = parse_ts(p["playCooldownEndsAt"])
 
-        if parse_ts(p["playCooldownEndsAt"]) <= now:
-            log(f"{name}: playing (mood {p['currentMood']:.0f})")
-            played += do(f"/collection/{pid}", "playAction", [pid], "play")
+        # --- feed ---
+        if feed_dt > now:
+            on_cooldown += 1
+            next_feed.append((feed_dt, name))
+            feed_state = f"feed: cooldown {fmt_cd(feed_dt, now)}"
+        elif DRY_RUN:
+            feed_state = "feed: READY (dry-run)"
+        else:
+            status, detail = act(pid, "feedAction")
+            if status == "ok":
+                fed += 1; feed_state = "feed: FED"
+            elif status == "cooldown":
+                on_cooldown += 1; feed_state = "feed: cooldown (race)"
+            else:
+                failed += 1; feed_state = f"feed: FAILED ({detail})"
 
-    gift = me.get("dailyGift", {})
+        # --- play ---
+        if play_dt > now:
+            on_cooldown += 1
+            next_play.append((play_dt, name))
+            play_state = f"play: cooldown {fmt_cd(play_dt, now)}"
+        elif DRY_RUN:
+            play_state = "play: READY (dry-run)"
+        else:
+            status, detail = act(pid, "playAction")
+            if status == "ok":
+                played += 1; play_state = "play: PLAYED"
+            elif status == "cooldown":
+                on_cooldown += 1; play_state = "play: cooldown (race)"
+            else:
+                failed += 1; play_state = f"play: FAILED ({detail})"
+
+        log(f"{name:<14} [{species}] {stats} | {feed_state} | {play_state}")
+
+    # --- daily gift ---
     if gift.get("availableNow") and not DRY_RUN:
-        log("daily gift available -> claim")
-        c.call_action("/collection", actions["claimDailyGiftAction"], [])
+        status, detail = c.call_action("/collection", actions["claimDailyGiftAction"], [])
         # Verify by state rather than trusting the flight shape, which we haven't
         # observed: if it's still claimable afterwards, the claim really failed.
         _, after = c.get_json("/api/me")
         if (after or {}).get("dailyGift", {}).get("availableNow"):
             failed += 1
-            log("  gift claim failed: still available after claim")
+            log("daily-gift: CLAIM FAILED (still available after claim)")
+        else:
+            new_coins = (after or {}).get("coins", coins)
+            log(f"daily-gift: CLAIMED (coins {coins} -> {new_coins})")
+
+    def soonest(times):
+        if not times:
+            return "none pending"
+        dt, name = min(times, key=lambda t: t[0])
+        return f"{fmt_cd(dt, now)} ({name})"
 
     log(
-        f"summary: {len(collection)} pokemon | fed {fed} | played {played} | "
-        f"revived {revived} | coins {me.get('coins', '?')} | failures {failed}"
+        f"summary: pokemon={len(collection)} fed={fed} played={played} "
+        f"revived={revived} on-cooldown={on_cooldown} failures={failed}"
         + (" | DRY_RUN" if DRY_RUN else "")
+    )
+    log(
+        f"next actionable: feed in {soonest(next_feed)} | "
+        f"play in {soonest(next_play)} | coins={coins}"
     )
     return failed
 
