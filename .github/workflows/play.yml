@@ -1,0 +1,28 @@
+name: play-pokemons
+
+on:
+  schedule:
+    # Every 10 minutes. Feed cooldown is 30 min, play is 20 min, so this always
+    # catches a cooldown promptly even with GitHub's scheduling jitter.
+    - cron: "*/10 * * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+# Never let two runs overlap.
+concurrency:
+  group: play-pokemons
+  cancel-in-progress: false
+
+jobs:
+  play:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Run agent
+        env:
+          PKMN_EMAIL: ${{ secrets.PKMN_EMAIL }}
+          PKMN_PASSWORD: ${{ secrets.PKMN_PASSWORD }}
+        run: python3 agent.py
