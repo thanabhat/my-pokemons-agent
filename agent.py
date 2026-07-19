@@ -148,24 +148,42 @@ class Client:
         return None
 
 
-def login(c):
-    code, obj = c.get_json("/api/auth/csrf")
-    if not obj or "csrfToken" not in obj:
-        raise RuntimeError(f"csrf failed: HTTP {code}")
-    csrf = obj["csrfToken"]
+def login(c, attempts=4):
+    """Establish a NextAuth session, retrying transient auth-callback blips.
+
+    The credentials callback occasionally fails to set the session cookie (Vercel
+    cold start / momentary DB blip), which surfaces as a 200-but-empty
+    /api/auth/session. Since login is cheap, we just retry the whole flow with a
+    fresh CSRF token each time.
+    """
     email = os.environ["PKMN_EMAIL"]
     password = os.environ["PKMN_PASSWORD"]
-    c.post_form(
-        "/api/auth/callback/credentials",
-        {"csrfToken": csrf, "email": email, "password": password, "json": "true"},
+    last = "unknown"
+    for attempt in range(1, attempts + 1):
+        # Fresh cookie jar per attempt so a stale/failed CSRF cookie can't linger.
+        c.cj.clear()
+        code, obj = c.get_json("/api/auth/csrf")
+        if not obj or "csrfToken" not in obj:
+            last = f"csrf HTTP {code}"
+        else:
+            c.post_form(
+                "/api/auth/callback/credentials",
+                {"csrfToken": obj["csrfToken"], "email": email,
+                 "password": password, "json": "true"},
+            )
+            code, obj = c.get_json("/api/auth/session")
+            user = (obj or {}).get("user")
+            if user:
+                log(f"logged in as {user.get('name')} <{user.get('email')}>")
+                return
+            last = f"no session (HTTP {code})"
+        if attempt < attempts:
+            log(f"login attempt {attempt}/{attempts} failed ({last}); retrying")
+            time.sleep(2 * attempt)
+    raise RuntimeError(
+        f"login failed after {attempts} attempts: {last} "
+        "(if this persists, check PKMN_EMAIL/PKMN_PASSWORD)"
     )
-    code, obj = c.get_json("/api/auth/session")
-    user = (obj or {}).get("user")
-    if not user:
-        raise RuntimeError(
-            f"login failed: no session (HTTP {code}; check PKMN_EMAIL/PKMN_PASSWORD)"
-        )
-    log(f"logged in as {user.get('name')} <{user.get('email')}>")
 
 
 def discover_actions(c):
