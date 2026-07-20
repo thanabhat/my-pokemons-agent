@@ -37,14 +37,11 @@ import urllib.request
 BASE_URL = os.environ.get("PKMN_BASE_URL", "https://my-pokemons-web.vercel.app").rstrip("/")
 DRY_RUN = os.environ.get("DRY_RUN") == "1"
 
-# Fallback action IDs, used only if runtime discovery fails. These WILL go stale
-# when the game is redeployed; discovery is the primary path.
-FALLBACK_ACTIONS = {
-    "feedAction": "40115f17cb11d2b0ccbcc5580fe6d219a4d8360ed2",
-    "playAction": "4088859f69ca19214b325c856b174d972ef702ac71",
-    "reviveAction": "40ca9e11e4da0e2835abb417486044dcb005bba0cb",
-    "claimDailyGiftAction": "00d65b8e763404c26d064129e65497a9bc7279f886",
-}
+# Server-action IDs are content hashes that change on every game redeploy, so we
+# never hardcode them -- they're scraped live from the app's JS on each run (see
+# discover_actions). These must be present or the run can't do anything useful;
+# if discovery can't find them, we fail loudly rather than guess a stale ID.
+REQUIRED_ACTIONS = ("feedAction", "playAction", "reviveAction", "claimDailyGiftAction")
 
 
 def log(msg):
@@ -186,24 +183,47 @@ def login(c, attempts=4):
     )
 
 
-def discover_actions(c):
-    """Scrape current server-action IDs from the collection page's JS chunks."""
-    code, html = c.get("/collection")
-    if code != 200:
-        log(f"WARN: could not load /collection (HTTP {code}); using fallback IDs")
-        return dict(FALLBACK_ACTIONS)
-    chunks = sorted(set(re.findall(r"/_next/static/chunks/[^\"\\]+\.js", html)))
-    actions = {}
+def discover_actions(c, sample_pid=None):
+    """Scrape current server-action IDs from the app's JS chunks.
+
+    Actions are split across pages: claim-gift/logout live on the collection
+    grid, while feed/play/revive/rename live on the *detail* page's lazy chunks.
+    We must scan both, otherwise the per-pokemon actions silently go missing.
+    Passing a real pokemon id lets us load the detail route.
+    """
     pat = re.compile(
         r'createServerReference\)?\("([0-9a-f]+)",[^,]+,[^,]+,[^,]+,"([^"]+)"'
     )
-    for ch in chunks:
-        _, text = c.get(ch)
-        for m in pat.finditer(text):
-            actions[m.group(2)] = m.group(1)
-    # Fill any gaps from the fallback table.
-    for name, aid in FALLBACK_ACTIONS.items():
-        actions.setdefault(name, aid)
+    pages = ["/collection"]
+    if sample_pid:
+        pages.append(f"/collection/{sample_pid}")
+
+    actions = {}
+    seen_chunks = set()
+    for page in pages:
+        code, html = c.get(page)
+        if code != 200:
+            log(f"WARN: could not load {page} (HTTP {code}) during action discovery")
+            continue
+        for ch in sorted(set(re.findall(r"/_next/static/chunks/[^\"\\]+\.js", html))):
+            if ch in seen_chunks:
+                continue
+            seen_chunks.add(ch)
+            _, text = c.get(ch)
+            for m in pat.finditer(text):
+                actions[m.group(2)] = m.group(1)
+
+    missing = [a for a in REQUIRED_ACTIONS if a not in actions]
+    if missing:
+        # Fail loudly instead of guessing a stale ID -- a stale ID 404s on every
+        # pokemon and produces a wall of confusing per-pokemon failures. This most
+        # likely means the game's bundle format changed and the regex needs an
+        # update, or the detail page couldn't be loaded this run.
+        raise RuntimeError(
+            "could not discover required actions "
+            f"{missing} (found: {sorted(actions)}). The game's JS bundle may have "
+            "changed -- discover_actions() needs updating."
+        )
     log("discovered actions: " + ", ".join(sorted(actions)))
     return actions
 
@@ -238,11 +258,15 @@ def fmt_cd(dt, now):
 def run():
     c = Client()
     login(c)
-    actions = discover_actions(c)
 
     code, collection = c.get_json("/api/collection")
     if not isinstance(collection, list):
         raise RuntimeError(f"collection fetch failed: HTTP {code}")
+
+    # Discover actions after the collection so we have a real pokemon id to load
+    # the detail page, where feed/play/revive/rename actions are bundled.
+    sample_pid = collection[0]["id"] if collection else None
+    actions = discover_actions(c, sample_pid)
 
     _, me = c.get_json("/api/me")
     me = me or {}
